@@ -257,7 +257,11 @@ async function poll(applyNow) {
     if (!playing || signature(next) !== signature(remote)) {
       await preload(next);
       remote = next;
-      if (playing && !applyNow) pending = buildQueue();
+      /* Holding a change back until the cycle ends only makes sense when a
+         cycle is actually turning. With a single slide there is no timer and
+         no boundary will ever arrive, so a queued change would wait forever.
+         In that case take it up straight away. */
+      if (playing && !applyNow && panes.length > 1) pending = buildQueue();
       else start(buildQueue());
     }
   } catch (err) {
