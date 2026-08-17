@@ -42,6 +42,9 @@
   button.b:hover { border-color:var(--red); }
   button.b.primary { background:var(--red); border-color:var(--red); color:#fff; font-weight:600; padding:13px 28px; }
   button.b:disabled { opacity:.45; cursor:default; }
+  .hold { display:flex; align-items:center; gap:8px; font-size:15px; }
+  .hold input { width:64px; padding:10px; font:15px var(--font); border:1px solid var(--line);
+                border-radius:8px; background:#fff; color:var(--brown); }
   .note { font-size:14px; color:#7d6a5c; margin:10px 0 0; line-height:1.6; max-width:76ch; }
   .note b { color:var(--brown); }
   .err { color:var(--red); font-weight:600; }
@@ -123,6 +126,7 @@
     <div class="bar">
       <button class="b primary" id="resumeBtn">Back to the loop</button>
       <button class="b" id="refreshBtn">Check for changes now</button>
+      <label class="hold">Hold each <input id="hold" type="number" min="1" max="120" step="1"> seconds</label>
       <span class="note" id="count"></span>
     </div>
     <p class="note" id="trayNote"></p>
@@ -158,7 +162,7 @@ const REPO = Object.assign(
   detectRepo() || { owner:'ilhamissak', name:'moca-foyer-screen' }
 );
 
-const HOLD_MS = 10000;    // time each poster holds
+const HOLD_DEFAULT = 15;  // seconds each poster holds, unless changed in Manage
 const FADE_MS = 600;      // crossfade, matches the CSS transition
 const POLL_MS = 120000;   // 2 min; unauthenticated GitHub allows 60 calls an hour
 const IDLE_MS = 3500;     // how long the Manage button lingers after the mouse stops
@@ -176,6 +180,12 @@ const prefs = {
   set(k, v) { try { localStorage.setItem(k, v); } catch (_) {} }
 };
 let newsletterOn = prefs.get('moca.newsletter','on') !== 'off';
+
+/* Hold time is remembered on this machine. Clamped on the way in so a
+   stored or typed nonsense value can never stall the loop. */
+const clampHold = n => Math.min(120, Math.max(1, Math.round(Number(n) || HOLD_DEFAULT)));
+let holdSec = clampHold(prefs.get('moca.hold', HOLD_DEFAULT));
+const holdMs = () => holdSec * 1000;
 
 /* ---------- the newsletter slide ------------------------------------- */
 
@@ -268,7 +278,7 @@ function buildQueue() {
 
 function start(next) {
   queue = next; pending = null; index = 0;
-  clearInterval(timer); timer = null;
+  clearTimeout(timer); timer = null;
 
   const stage = $('stage');
   stage.innerHTML = '';
@@ -301,7 +311,21 @@ function start(next) {
   fitNewsletters();
   panes[0].classList.add('vis');
   playing = true;
-  if (panes.length > 1) timer = setInterval(advance, HOLD_MS);
+  schedule();
+}
+
+/* A self-scheduling timeout rather than a fixed interval, so a change to the
+   hold time is picked up from the next poster onward and never cuts the one
+   currently on screen. */
+function schedule() {
+  clearTimeout(timer);
+  timer = null;
+  if (panes.length > 1) timer = setTimeout(tick, holdMs());
+}
+
+function tick() {
+  advance();
+  schedule();
 }
 
 function advance() {
@@ -340,8 +364,9 @@ function renderTray() {
   grid.appendChild(card(NEWSLETTER, true));
   fitNewsletters();
 
+  $('hold').value = holdSec;
   const live = remote.length + (newsletterOn ? 1 : 0);
-  $('count').textContent = live ? `${live} in rotation, ${(live*HOLD_MS)/1000}s per cycle` : 'Nothing to play yet';
+  $('count').textContent = live ? `${live} in rotation, ${live*holdSec}s per cycle` : 'Nothing to play yet';
 
   const bits = [`Posters come from the <b>${REPO.dir}</b> folder in <b>${REPO.owner}/${REPO.name}</b>. ` +
     `Add or delete files there from any computer. This screen checks every ${POLL_MS/60000} minutes ` +
@@ -401,6 +426,15 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':
 
 $('manageBtn').onclick = openTray;
 $('resumeBtn').onclick = closeTray;
+
+/* Takes effect from the next poster, so the one on screen is never cut. */
+$('hold').addEventListener('change', e => {
+  holdSec = clampHold(e.target.value);
+  e.target.value = holdSec;
+  prefs.set('moca.hold', holdSec);
+  renderTray();
+});
+
 $('refreshBtn').onclick = async () => {
   const b = $('refreshBtn');
   b.disabled = true; b.textContent = 'Checking…';
