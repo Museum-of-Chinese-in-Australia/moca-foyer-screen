@@ -36,6 +36,10 @@
   header { display:flex; align-items:baseline; gap:18px; }
   h1 { font-size:29px; font-weight:700; letter-spacing:-.02em; margin:0; }
   .cjk { font-size:15px; color:var(--red); }
+  .card.live { border-color:var(--red); box-shadow:0 0 0 2px var(--red); }
+  .tk { font-size:12px; font-weight:600; margin:4px 0 0; }
+  .tk.on { color:var(--red); }
+  .tk.off { color:#8b7a6c; }
   .bar { display:flex; align-items:center; gap:13px; margin:24px 0 8px; flex-wrap:wrap; }
   button.b { font:15px var(--font); border-radius:8px; border:1px solid var(--line);
              background:#fff; color:var(--brown); padding:11px 18px; cursor:pointer; }
@@ -162,6 +166,15 @@ const REPO = Object.assign(
   detectRepo() || { owner:'ilhamissak', name:'moca-foyer-screen' }
 );
 
+/* Assets sit at the repository root, but this page may be served from a
+   subfolder such as /preview/. Build an absolute prefix so one file works
+   from either place without editing on promotion. */
+const ASSET_PREFIX = (function () {
+  const seg = location.pathname.match(/^\/[^/]+\//);
+  if (location.hostname.toLowerCase().endsWith('github.io') && seg) return seg[0];
+  return '/';
+})();
+
 const HOLD_DEFAULT = 15;  // seconds each poster holds, unless changed in Manage
 const FADE_MS = 600;      // crossfade, matches the CSS transition
 const POLL_MS = 120000;   // 2 min; unauthenticated GitHub allows 60 calls an hour
@@ -199,7 +212,7 @@ function newsletterEl() {
         '<h2>MOCA in<br><em>your inbox</em></h2>' +
         '<p class="nl-sub">Exhibitions, events and stories, before anyone else.</p>' +
         '<div class="nl-spacer"></div>' +
-        '<img class="nl-logo" src="assets/moca-logo-red.svg" alt="">' +
+        '<img class="nl-logo" src="' + ASSET_PREFIX + 'assets/moca-logo-red.svg" alt="">' +
       '</div>' +
       '<div class="nl-right">' +
         '<div class="nl-qr"><img src="' + QR_SRC + '" alt=""></div>' +
@@ -221,6 +234,138 @@ function fitNewsletters() {
 }
 window.addEventListener('resize', fitNewsletters);
 
+/* ---------- Sydney time and takeover filenames ------------------------ */
+
+const TZ = 'Australia/Sydney';
+
+/* How far Sydney is from UTC at a given instant. Read from the platform's
+   timezone database via Intl, so daylight saving is never our problem. */
+function tzOffsetMs(instant) {
+  const p = new Intl.DateTimeFormat('en-GB', {
+    timeZone: TZ, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  }).formatToParts(instant).reduce((a, x) => (a[x.type] = x.value, a), {});
+  const h = p.hour === '24' ? 0 : Number(p.hour);
+  const asUTC = Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day),
+                         h, Number(p.minute), Number(p.second));
+  return asUTC - instant.getTime();
+}
+
+/* Turn a Sydney wall-clock reading into a real instant. Resolved twice so a
+   time sitting near a daylight-saving change lands on the correct side. */
+function sydneyInstant(y, mo, d, h, mi) {
+  const naive = Date.UTC(y, mo - 1, d, h, mi);
+  let t = naive - tzOffsetMs(new Date(naive));
+  t = naive - tzOffsetMs(new Date(t));
+  return t;
+}
+
+const TAKEOVER_RE = /^takeover-/i;
+
+/* Today's date as Sydney sees it, for end-only filenames. */
+function sydneyToday() {
+  const p = new Intl.DateTimeFormat('en-GB', {
+    timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(new Date()).reduce((a, x) => (a[x.type] = x.value, a), {});
+  return [Number(p.year), Number(p.month), Number(p.day)];
+}
+
+/* takeover-<name>                          fires as soon as it is seen
+   takeover-YYYYMMDD-HHMM                   starts then, runs until deleted
+   takeover-YYYYMMDD-HHMM-HHMM              ends the same day
+   takeover-YYYYMMDD-HHMM-YYYYMMDD-HHMM     ends on the given day
+   Anything after the timestamps is ignored, so files can carry a description.
+   A timestamp we cannot read falls back to firing immediately: a poster
+   appearing early is noticed, one that silently never appears is not. */
+function parseTakeover(name) {
+  if (!TAKEOVER_RE.test(name)) return null;
+
+  const body = name.replace(/\.[^.]+$/, '').replace(TAKEOVER_RE, '');
+  const parts = body.split('-');
+
+  const dOf = t => [Number(t.slice(0, 4)), Number(t.slice(4, 6)), Number(t.slice(6, 8))];
+  const tOf = t => [Number(t.slice(0, 2)), Number(t.slice(2, 4))];
+  const ok  = (h, mi) => h >= 0 && h <= 23 && mi >= 0 && mi <= 59;
+
+  /* takeover-endYYYYMMDD-HHMM  and  takeover-endHHMM
+     start immediately, stop at the stated time. */
+  const em = /^end(\d{8}|\d{4})$/i.exec(parts[0] || '');
+  if (em) {
+    const v = em[1];
+    let e = null;
+    if (v.length === 8 && /^\d{4}$/.test(parts[1] || '')) {
+      const [y, mo, d] = dOf(v);
+      const [h, mi] = tOf(parts[1]);
+      if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31 && ok(h, mi)) e = sydneyInstant(y, mo, d, h, mi);
+    } else if (v.length === 4) {
+      const [h, mi] = tOf(v);
+      if (ok(h, mi)) {
+        const [y, mo, d] = sydneyToday();
+        e = sydneyInstant(y, mo, d, h, mi);
+        if (e <= Date.now()) {            /* that hour has gone, so mean tomorrow */
+          const nx = new Date(Date.UTC(y, mo - 1, d + 1));
+          e = sydneyInstant(nx.getUTCFullYear(), nx.getUTCMonth() + 1, nx.getUTCDate(), h, mi);
+        }
+      }
+    }
+    return { start: null, end: (e !== null && isFinite(e)) ? e : null };
+  }
+
+  const tok = [];
+  for (const t of body.split('-')) {
+    if (/^\d{8}$/.test(t) || /^\d{4}$/.test(t)) tok.push(t);
+    else break;
+  }
+
+  const asDate = t => [Number(t.slice(0, 4)), Number(t.slice(4, 6)), Number(t.slice(6, 8))];
+  const asTime = t => [Number(t.slice(0, 2)), Number(t.slice(2, 4))];
+  const sane = (h, mi) => h >= 0 && h <= 23 && mi >= 0 && mi <= 59;
+
+  let start = null, end = null;
+
+  if (tok.length >= 2 && tok[0].length === 8 && tok[1].length === 4) {
+    const [y, mo, d] = asDate(tok[0]);
+    const [h, mi] = asTime(tok[1]);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31 && sane(h, mi)) {
+      start = sydneyInstant(y, mo, d, h, mi);
+
+      if (tok.length >= 4 && tok[2].length === 8 && tok[3].length === 4) {
+        const [ey, emo, ed] = asDate(tok[2]);
+        const [eh, emi] = asTime(tok[3]);
+        if (sane(eh, emi)) end = sydneyInstant(ey, emo, ed, eh, emi);
+      } else if (tok.length >= 3 && tok[2].length === 4) {
+        const [eh, emi] = asTime(tok[2]);
+        if (sane(eh, emi)) {
+          end = sydneyInstant(y, mo, d, eh, emi);
+          if (end <= start) {
+            /* an end at or before the start reads as crossing midnight */
+            const nx = new Date(Date.UTC(y, mo - 1, d + 1));
+            end = sydneyInstant(nx.getUTCFullYear(), nx.getUTCMonth() + 1,
+                                nx.getUTCDate(), eh, emi);
+          }
+        }
+      }
+    }
+  }
+
+  if (start !== null && !isFinite(start)) start = null;
+  if (end !== null && !isFinite(end)) end = null;
+  return { start, end };
+}
+
+function takeoverLive(tk, now) {
+  if (!tk) return false;
+  if (tk.start !== null && now < tk.start) return false;
+  if (tk.end !== null && now >= tk.end) return false;
+  return true;
+}
+
+const fmtSyd = t => new Intl.DateTimeFormat('en-AU', {
+  timeZone: TZ, day: 'numeric', month: 'short',
+  hour: '2-digit', minute: '2-digit', hour12: false
+}).format(new Date(t));
+
 /* ---------- reading the repo ----------------------------------------- */
 
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|avif)$/i;
@@ -236,10 +381,14 @@ async function fetchPosters() {
   return rows
     .filter(r => r.type === 'file' && IMAGE_RE.test(r.name) && r.download_url)
     .sort((a,b) => a.name.localeCompare(b.name, undefined, { numeric:true }))
-    .map(r => ({ kind:'image', name:r.name, src:r.download_url, sha:r.sha }));
+    .map(r => ({ kind:'image', name:r.name, src:r.download_url, sha:r.sha,
+                 takeover: parseTakeover(r.name) }));
 }
 
-const signature = list => list.map(p => p.sha).join('|');
+/* Identity must include the name, not just the blob. A rename keeps the
+   same content and therefore the same sha, but the name now carries the
+   takeover schedule, so a rename is a real change. */
+const signature = list => list.map(p => p.name + '@' + p.sha).join('|');
 
 function preload(list) {
   return Promise.all(list.map(p => new Promise(resolve => {
@@ -257,12 +406,9 @@ async function poll(applyNow) {
     if (!playing || signature(next) !== signature(remote)) {
       await preload(next);
       remote = next;
-      /* Holding a change back until the cycle ends only makes sense when a
-         cycle is actually turning. With a single slide there is no timer and
-         no boundary will ever arrive, so a queued change would wait forever.
-         In that case take it up straight away. */
-      if (playing && !applyNow && panes.length > 1) pending = buildQueue();
-      else start(buildQueue());
+      applyState(applyNow);
+    } else {
+      scheduleTransition();   // file list unchanged, but clocks may have moved
     }
   } catch (err) {
     lastError = err.message;
@@ -272,10 +418,60 @@ async function poll(applyNow) {
   if (trayOpen()) renderTray();
 }
 
-function buildQueue() {
-  const q = remote.slice();
+function buildQueue(now) {
+  now = now || Date.now();
+
+  /* A live takeover owns the screen outright: no posters, no newsletter.
+     Several at once rotate among themselves and nothing else. */
+  const live = remote.filter(p => takeoverLive(p.takeover, now));
+  if (live.length) return live;
+
+  /* Takeover files that have not started, or have expired, stay out of the
+     normal rotation entirely rather than showing as ordinary posters. */
+  const q = remote.filter(p => !p.takeover);
   if (newsletterOn) q.push(NEWSLETTER);   // always last
   return q;
+}
+
+const queueSig = q => q.map(p => p.kind === 'newsletter' ? 'NEWSLETTER' : p.name).join('|');
+
+/* Recompute what should be on screen now and move to it if that differs.
+   Called by the poll, by the clock when a takeover starts or ends, and
+   whenever the newsletter is toggled. */
+function applyState(applyNow) {
+  const next = buildQueue();
+
+  if (!playing || queueSig(next) !== queueSig(queue)) {
+    if (playing && !applyNow && panes.length > 1) pending = next;
+    else start(next);
+  } else if (pending && queueSig(pending) === queueSig(queue)) {
+    pending = null;                       // a queued change that is now moot
+  }
+
+  scheduleTransition();
+  if (trayOpen()) renderTray();
+}
+
+/* Takeovers start and end on the clock, not on the polling interval, so the
+   next boundary gets its own timer and fires on time. Capped so a distant
+   date is re-evaluated periodically rather than trusted to one long timer. */
+let transitionTimer = null;
+function scheduleTransition() {
+  clearTimeout(transitionTimer);
+  transitionTimer = null;
+
+  const now = Date.now();
+  let soonest = Infinity;
+  for (const p of remote) {
+    if (!p.takeover) continue;
+    const { start: s, end: e } = p.takeover;
+    if (s !== null && s > now) soonest = Math.min(soonest, s);
+    if (e !== null && e > now) soonest = Math.min(soonest, e);
+  }
+  if (soonest === Infinity) return;
+
+  const delay = Math.min(soonest - now + 250, 6 * 3600 * 1000);
+  transitionTimer = setTimeout(() => applyState(), Math.max(delay, 250));
 }
 
 /* ---------- the loop -------------------------------------------------- */
@@ -369,8 +565,15 @@ function renderTray() {
   fitNewsletters();
 
   $('hold').value = holdSec;
-  const live = remote.length + (newsletterOn ? 1 : 0);
-  $('count').textContent = live ? `${live} in rotation, ${live*holdSec}s per cycle` : 'Nothing to play yet';
+  const onAir = remote.filter(p => takeoverLive(p.takeover, Date.now()));
+  if (onAir.length) {
+    $('count').textContent = onAir.length === 1
+      ? `Takeover on air, posters and newsletter paused`
+      : `${onAir.length} takeovers on air, ${onAir.length*holdSec}s per cycle, everything else paused`;
+  } else {
+    const live = remote.filter(p => !p.takeover).length + (newsletterOn ? 1 : 0);
+    $('count').textContent = live ? `${live} in rotation, ${live*holdSec}s per cycle` : 'Nothing to play yet';
+  }
 
   const bits = [`Posters come from the <b>${REPO.dir}</b> folder in <b>${REPO.owner}/${REPO.name}</b>. ` +
     `Add or delete files there from any computer. This screen checks every ${POLL_MS/60000} minutes ` +
@@ -392,7 +595,9 @@ function card(p, isNewsletter) {
   const meta = document.createElement('div');
   meta.className = 'meta';
   meta.innerHTML = `<p class="name">${esc(p.name)}</p>` +
-    `<p class="dims">${isNewsletter ? '2:1, drawn to fit' : (p.w && p.h ? p.w+' × '+p.h : 'image') + shape(p)}</p>`;
+    `<p class="dims">${isNewsletter ? '2:1, drawn to fit' : (p.w && p.h ? p.w+' × '+p.h : 'image') + shape(p)}</p>` +
+    takeoverNote(p);
+  if (!isNewsletter && takeoverLive(p.takeover, Date.now())) el.classList.add('live');
 
   el.append(thumb, meta);
 
@@ -405,7 +610,7 @@ function card(p, isNewsletter) {
     b.onclick = () => {
       newsletterOn = !newsletterOn;
       prefs.set('moca.newsletter', newsletterOn ? 'on' : 'off');
-      pending = buildQueue();       // applies at the cycle boundary like any other change
+      applyState();                 // applies at the cycle boundary like any other change
       renderTray();
     };
     acts.appendChild(b);
@@ -415,6 +620,21 @@ function card(p, isNewsletter) {
     el.append(acts, badge);
   }
   return el;
+}
+
+/* Plain-language state for a takeover file, so what the screen is about to
+   do is readable at a glance rather than inferred from the filename. */
+function takeoverNote(p) {
+  const tk = p.takeover;
+  if (!tk) return '';
+  const now = Date.now();
+  if (tk.start !== null && now < tk.start)
+    return `<p class="tk off">Takeover, waiting until ${fmtSyd(tk.start)}` +
+           (tk.end !== null ? ` then until ${fmtSyd(tk.end)}` : '') + `</p>`;
+  if (tk.end !== null && now >= tk.end)
+    return `<p class="tk off">Takeover, expired ${fmtSyd(tk.end)}. Safe to delete.</p>`;
+  return `<p class="tk on">TAKEOVER ON AIR` +
+         (tk.end !== null ? `, until ${fmtSyd(tk.end)}` : ', until deleted') + `</p>`;
 }
 
 function shape(p) {
