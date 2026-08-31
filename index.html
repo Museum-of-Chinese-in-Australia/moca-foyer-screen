@@ -3,6 +3,21 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+
+<!-- Android WebView applies algorithmic darkening (force dark) to pages that do
+     not say which colour schemes they support, and Android TV runs a dark system
+     theme. On the foyer Chromecast that inverted the newsletter slide: its sand
+     background came out near-black and its brown text came out cream. Posters
+     were untouched, because force dark never alters bitmaps, and the newsletter
+     is the only slide drawn in the page rather than stored as an image. Saying
+     only light here declares that this page paints its own colours and the
+     browser must not second-guess them.
+
+     Added 31 Aug 2026 for the Chromecast with Google TV in the foyer. Nothing
+     else in this file depends on it: delete this tag to restore the previous
+     behaviour exactly. On the Mac mini it changes nothing visible. -->
+<meta name="color-scheme" content="only light">
+
 <title>MOCA Foyer Screen</title>
 <style>
   :root { --sand:#F5ECE4; --brown:#2E1505; --red:#B45B38; --line:#DCCFC3;
