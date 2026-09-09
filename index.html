@@ -381,6 +381,48 @@ const fmtSyd = t => new Intl.DateTimeFormat('en-AU', {
   hour: '2-digit', minute: '2-digit', hour12: false
 }).format(new Date(t));
 
+/* An ordinary poster can carry its own expiry with a -until suffix, so an
+   event poster comes down by itself when nobody remembers to remove it. The
+   suffix sits at the END of the name so it never disturbs the leading sort
+   key that decides play order.
+
+     04-10sep-timperley-until20260911-0900.png   comes down 11 Sep 09:00
+     04-10sep-timperley-until20260911.png        comes down at the end of 11 Sep
+
+   Takeover files are untouched by this: they carry their own start and end. */
+const UNTIL_RE = /-until(\d{8})(?:-(\d{4}))?$/i;
+
+function parseUntil(name) {
+  const m = UNTIL_RE.exec(name.replace(/\.[^.]+$/, ''));
+  if (!m) return null;
+
+  const y  = Number(m[1].slice(0, 4));
+  const mo = Number(m[1].slice(4, 6));
+  const d  = Number(m[1].slice(6, 8));
+  if (!(mo >= 1 && mo <= 12 && d >= 1 && d <= 31)) return null;
+
+  /* Reject a day that does not exist, such as 31 September. Left alone it
+     would roll silently into the next month and take the poster down on a
+     date nobody wrote. Failing to "never expires" keeps it on screen, which
+     is the visible failure rather than the invisible one. */
+  const probe = new Date(Date.UTC(y, mo - 1, d));
+  if (probe.getUTCMonth() !== mo - 1 || probe.getUTCDate() !== d) return null;
+
+  let t;
+  if (m[2]) {
+    const h = Number(m[2].slice(0, 2)), mi = Number(m[2].slice(2, 4));
+    if (!(h >= 0 && h <= 23 && mi >= 0 && mi <= 59)) return null;
+    t = sydneyInstant(y, mo, d, h, mi);
+  } else {
+    /* a date on its own means all of that day, so it ends at the next midnight */
+    const nx = new Date(Date.UTC(y, mo - 1, d + 1));
+    t = sydneyInstant(nx.getUTCFullYear(), nx.getUTCMonth() + 1, nx.getUTCDate(), 0, 0);
+  }
+  return isFinite(t) ? t : null;
+}
+
+const expired = (p, now) => p.until !== null && p.until !== undefined && now >= p.until;
+
 /* ---------- reading the repo ----------------------------------------- */
 
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|avif)$/i;
@@ -397,7 +439,8 @@ async function fetchPosters() {
     .filter(r => r.type === 'file' && IMAGE_RE.test(r.name) && r.download_url)
     .sort((a,b) => a.name.localeCompare(b.name, undefined, { numeric:true }))
     .map(r => ({ kind:'image', name:r.name, src:r.download_url, sha:r.sha,
-                 takeover: parseTakeover(r.name) }));
+                 takeover: parseTakeover(r.name),
+                 until: parseUntil(r.name) }));
 }
 
 /* Identity must include the name, not just the blob. A rename keeps the
@@ -442,8 +485,9 @@ function buildQueue(now) {
   if (live.length) return live;
 
   /* Takeover files that have not started, or have expired, stay out of the
-     normal rotation entirely rather than showing as ordinary posters. */
-  const q = remote.filter(p => !p.takeover);
+     normal rotation entirely rather than showing as ordinary posters. So do
+     ordinary posters that have passed their own -until time. */
+  const q = remote.filter(p => !p.takeover && !expired(p, now));
   if (newsletterOn) q.push(NEWSLETTER);   // always last
   return q;
 }
@@ -478,6 +522,8 @@ function scheduleTransition() {
   const now = Date.now();
   let soonest = Infinity;
   for (const p of remote) {
+    if (p.until !== null && p.until !== undefined && p.until > now)
+      soonest = Math.min(soonest, p.until);
     if (!p.takeover) continue;
     const { start: s, end: e } = p.takeover;
     if (s !== null && s > now) soonest = Math.min(soonest, s);
@@ -586,7 +632,7 @@ function renderTray() {
       ? `Takeover on air, posters and newsletter paused`
       : `${onAir.length} takeovers on air, ${onAir.length*holdSec}s per cycle, everything else paused`;
   } else {
-    const live = remote.filter(p => !p.takeover).length + (newsletterOn ? 1 : 0);
+    const live = remote.filter(p => !p.takeover && !expired(p, Date.now())).length + (newsletterOn ? 1 : 0);
     $('count').textContent = live ? `${live} in rotation, ${live*holdSec}s per cycle` : 'Nothing to play yet';
   }
 
@@ -600,7 +646,8 @@ function renderTray() {
 
 function card(p, isNewsletter) {
   const el = document.createElement('div');
-  el.className = 'card' + (isNewsletter ? ' pinned' : '') + (isNewsletter && !newsletterOn ? ' off' : '');
+  el.className = 'card' + (isNewsletter ? ' pinned' : '') +
+    ((isNewsletter && !newsletterOn) || (!isNewsletter && expired(p, Date.now())) ? ' off' : '');
 
   const thumb = document.createElement('div');
   thumb.className = 'thumb';
@@ -641,7 +688,12 @@ function card(p, isNewsletter) {
    do is readable at a glance rather than inferred from the filename. */
 function takeoverNote(p) {
   const tk = p.takeover;
-  if (!tk) return '';
+  if (!tk) {
+    if (p.until === null || p.until === undefined) return '';
+    return Date.now() >= p.until
+      ? `<p class="tk off">Came down ${fmtSyd(p.until)}. Safe to delete.</p>`
+      : `<p class="tk off">Comes down ${fmtSyd(p.until)}</p>`;
+  }
   const now = Date.now();
   if (tk.start !== null && now < tk.start)
     return `<p class="tk off">Takeover, waiting until ${fmtSyd(tk.start)}` +
