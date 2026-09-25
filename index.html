@@ -30,6 +30,7 @@
   .slide { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
            opacity:0; transition:opacity 600ms ease-in-out; }
   .slide.vis { opacity:1; }
+  .slide > video { width:100%; height:100%; object-fit:contain; display:block; }
   .slide > img { max-width:100%; max-height:100%; width:auto; height:auto; display:block; }
 
   #status { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
@@ -145,7 +146,7 @@
     <div class="bar">
       <button class="b primary" id="resumeBtn">Back to the loop</button>
       <button class="b" id="refreshBtn">Check for changes now</button>
-      <label class="hold">Hold each <input id="hold" type="number" min="1" max="120" step="1"> seconds</label>
+      <label class="hold">Hold each image <input id="hold" type="number" min="1" max="120" step="1"> seconds</label>
       <span class="note" id="count"></span>
     </div>
     <p class="note" id="trayNote"></p>
@@ -178,7 +179,7 @@ function detectRepo() {
 
 const REPO = Object.assign(
   { branch:'main', dir:'posters' },
-  detectRepo() || { owner:'ilhamissak', name:'moca-foyer-screen' }
+  detectRepo() || { owner:'Museum-of-Chinese-in-Australia', name:'moca-foyer-screen' }
 );
 
 /* Assets sit at the repository root, but this page may be served from a
@@ -190,6 +191,7 @@ const ASSET_PREFIX = (function () {
   return '/';
 })();
 
+const LOCAL_PREVIEW = false;
 const HOLD_DEFAULT = 15;  // seconds each poster holds, unless changed in Manage
 const FADE_MS = 600;      // crossfade, matches the CSS transition
 const POLL_MS = 120000;   // 2 min; unauthenticated GitHub allows 60 calls an hour
@@ -426,9 +428,10 @@ const expired = (p, now) => p.until !== null && p.until !== undefined && now >= 
 /* ---------- reading the repo ----------------------------------------- */
 
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|avif)$/i;
+const VIDEO_RE = /\.(mp4|webm|m4v)$/i;
 
 async function fetchPosters() {
-  const url = `https://api.github.com/repos/${REPO.owner}/${REPO.name}/contents/${REPO.dir}?ref=${REPO.branch}`;
+  const url = LOCAL_PREVIEW ? '/preview-playlist.json' : `https://api.github.com/repos/${REPO.owner}/${REPO.name}/contents/${REPO.dir}?ref=${REPO.branch}`;
   const res = await fetch(url, { headers:{ 'Accept':'application/vnd.github+json' }, cache:'no-store' });
   if (res.status === 404) throw new Error(`No "${REPO.dir}" folder in ${REPO.owner}/${REPO.name}`);
   if (res.status === 403) throw new Error('GitHub rate limit reached, will retry shortly');
@@ -436,9 +439,9 @@ async function fetchPosters() {
   const rows = await res.json();
   if (!Array.isArray(rows)) throw new Error(`"${REPO.dir}" is not a folder`);
   return rows
-    .filter(r => r.type === 'file' && IMAGE_RE.test(r.name) && r.download_url)
+    .filter(r => r.type === 'file' && (IMAGE_RE.test(r.name) || VIDEO_RE.test(r.name)) && r.download_url)
     .sort((a,b) => a.name.localeCompare(b.name, undefined, { numeric:true }))
-    .map(r => ({ kind:'image', name:r.name, src:r.download_url, sha:r.sha,
+    .map(r => ({ kind:VIDEO_RE.test(r.name) ? 'video' : 'image', name:r.name, src:r.download_url, sha:r.sha,
                  takeover: parseTakeover(r.name),
                  until: parseUntil(r.name) }));
 }
@@ -449,10 +452,11 @@ async function fetchPosters() {
 const signature = list => list.map(p => p.name + '@' + p.sha).join('|');
 
 function preload(list) {
-  return Promise.all(list.map(p => new Promise(resolve => {
+  return Promise.all(list.filter(p => p.kind !== 'video').map(p => new Promise(resolve => {
     const img = new Image();
-    img.onload  = () => { p.w = img.naturalWidth; p.h = img.naturalHeight; resolve(); };
-    img.onerror = () => resolve();
+    const deadline = setTimeout(resolve, 8000);
+    img.onload = () => { clearTimeout(deadline); p.w = img.naturalWidth; p.h = img.naturalHeight; resolve(); };
+    img.onerror = () => { clearTimeout(deadline); resolve(); };
     img.src = p.src;
   })));
 }
@@ -492,7 +496,7 @@ function buildQueue(now) {
   return q;
 }
 
-const queueSig = q => q.map(p => p.kind === 'newsletter' ? 'NEWSLETTER' : p.name).join('|');
+const queueSig = q => q.map(p => p.kind === 'newsletter' ? 'NEWSLETTER' : p.name + '@' + p.sha).join('|');
 
 /* Recompute what should be on screen now and move to it if that differs.
    Called by the poll, by the clock when a takeover starts or ends, and
@@ -503,7 +507,7 @@ function applyState(applyNow) {
   if (!playing || queueSig(next) !== queueSig(queue)) {
     if (playing && !applyNow && panes.length > 1) pending = next;
     else start(next);
-  } else if (pending && queueSig(pending) === queueSig(queue)) {
+  } else if (pending) {
     pending = null;                       // a queued change that is now moot
   }
 
@@ -532,73 +536,101 @@ function scheduleTransition() {
   if (soonest === Infinity) return;
 
   const delay = Math.min(soonest - now + 250, 6 * 3600 * 1000);
-  transitionTimer = setTimeout(() => applyState(), Math.max(delay, 250));
+  transitionTimer = setTimeout(() => applyState(true), Math.max(delay, 250));
 }
 
 /* ---------- the loop -------------------------------------------------- */
 
-function start(next) {
-  queue = next; pending = null; index = 0;
-  clearTimeout(timer); timer = null;
+let stopActiveVideo = null;
+let slideGeneration = 0;
+const VIDEO_STALL_MS = 20000;
 
+function stopMedia() {
+  slideGeneration++;
+  clearTimeout(timer); timer = null;
+  if (stopActiveVideo) { stopActiveVideo(); stopActiveVideo = null; }
+}
+
+function start(next) {
+  stopMedia();
+  queue = next; pending = null; index = 0;
   const stage = $('stage');
   stage.innerHTML = '';
-
+  panes = [];
   if (!queue.length) {
     playing = false;
     $('status').classList.remove('gone');
-    $('status').innerHTML = lastError
-      ? `Could not read the posters folder.<br><span style="font-size:20px">${lastError}</span>`
-      : `No posters yet.<br><span style="font-size:20px">Add images to the ${REPO.dir} folder in GitHub.</span>`;
+    $('status').textContent = lastError || 'No media yet. Add images or MP4 videos to the posters folder in GitHub.';
     return;
   }
-
   $('status').classList.add('gone');
-
   panes = queue.map(p => {
     const pane = document.createElement('div');
     pane.className = 'slide';
-    if (p.kind === 'newsletter') {
-      pane.appendChild(newsletterEl());
+    if (p.kind === 'newsletter') pane.appendChild(newsletterEl());
+    else if (p.kind === 'video') {
+      const video = document.createElement('video');
+      video.muted = true; video.defaultMuted = true;
+      video.setAttribute('muted', ''); video.setAttribute('playsinline', '');
+      video.preload = 'none'; video.loop = false;
+      video.setAttribute('aria-label', p.name);
+      pane.appendChild(video);
     } else {
-      const img = document.createElement('img');
-      img.src = p.src;
+      const img = document.createElement('img'); img.src = p.src;
       pane.appendChild(img);
     }
     stage.appendChild(pane);
     return pane;
   });
-
   fitNewsletters();
-  panes[0].classList.add('vis');
   playing = true;
-  schedule();
+  showCurrent();
 }
 
-/* A self-scheduling timeout rather than a fixed interval, so a change to the
-   hold time is picked up from the next poster onward and never cuts the one
-   currently on screen. */
-function schedule() {
-  clearTimeout(timer);
-  timer = null;
-  if (panes.length > 1) timer = setTimeout(tick, holdMs());
-}
-
-function tick() {
-  advance();
-  schedule();
+function showCurrent() {
+  stopMedia();
+  panes.forEach((pane, i) => pane.classList.toggle('vis', i === index));
+  const p = queue[index];
+  const video = panes[index].querySelector('video');
+  if (!video) { if (panes.length > 1 || pending) timer = setTimeout(advance, holdMs()); return; }
+  const generation = slideGeneration;
+  let watchdog, finished = false, lastPosition = -1, lastProgress = Date.now();
+  const active = () => generation === slideGeneration && !finished;
+  const finish = (failed) => {
+    if (!active()) return;
+    finished = true;
+    clearInterval(watchdog);
+    if (failed) { p.playbackError = 'Could not play; skipped and will retry next cycle.'; console.warn(p.name, p.playbackError); }
+    // Avoid a tight retry loop if an unplayable video is the only item.
+    timer = setTimeout(advance, failed && panes.length === 1 ? holdMs() : 0);
+  };
+  video.onended = () => finish(false);
+  video.onerror = () => finish(true);
+  video.onloadedmetadata = () => { p.w = video.videoWidth; p.h = video.videoHeight; p.duration = video.duration; };
+  video.onplaying = () => { delete p.playbackError; lastProgress = Date.now(); };
+  stopActiveVideo = () => {
+    finished = true; clearInterval(watchdog);
+    video.onended = video.onerror = video.onloadedmetadata = video.onplaying = null;
+    video.pause(); video.removeAttribute('src'); video.load();
+  };
+  video.muted = true; video.src = p.src;
+  watchdog = setInterval(() => {
+    if (!active()) return;
+    if (video.currentTime > lastPosition + 0.05) { lastPosition = video.currentTime; lastProgress = Date.now(); }
+    if (Date.now() - lastProgress > VIDEO_STALL_MS) finish(true);
+  }, 1000);
+  try {
+    const result = video.play();
+    if (result && result.catch) result.catch(() => finish(true));
+  } catch (_) { finish(true); }
 }
 
 function advance() {
-  const out = panes[index];
-  index = (index + 1) % panes.length;
-
-  /* Back at the top means a cycle just finished, so a queued change can
-     take over without cutting a poster short. */
-  if (index === 0 && pending) { const n = pending; pending = null; start(n); return; }
-
-  panes[index].classList.add('vis');
-  setTimeout(() => out.classList.remove('vis'), FADE_MS);
+  if (!panes.length) return;
+  const nextIndex = (index + 1) % panes.length;
+  if (nextIndex === 0 && pending) { const next = pending; start(next); return; }
+  index = nextIndex;
+  showCurrent();
 }
 
 /* ---------- mouse-reveal controls -------------------------------------- */
@@ -611,6 +643,8 @@ function wake() {
 }
 document.addEventListener('mousemove', wake);
 document.addEventListener('mousedown', wake);
+document.addEventListener('keydown', wake);
+document.addEventListener('touchstart', wake, {passive:true});
 
 /* ---------- tray -------------------------------------------------------- */
 
@@ -630,13 +664,13 @@ function renderTray() {
   if (onAir.length) {
     $('count').textContent = onAir.length === 1
       ? `Takeover on air, posters and newsletter paused`
-      : `${onAir.length} takeovers on air, ${onAir.length*holdSec}s per cycle, everything else paused`;
+      : `${onAir.length} takeovers on air; videos play in full, everything else paused`;
   } else {
     const live = remote.filter(p => !p.takeover && !expired(p, Date.now())).length + (newsletterOn ? 1 : 0);
-    $('count').textContent = live ? `${live} in rotation, ${live*holdSec}s per cycle` : 'Nothing to play yet';
+    $('count').textContent = live ? `${live} in rotation; images ${holdSec}s, videos play in full (silent)` : 'Nothing to play yet';
   }
 
-  const bits = [`Posters come from the <b>${REPO.dir}</b> folder in <b>${REPO.owner}/${REPO.name}</b>. ` +
+  const bits = [`Images and videos come from the <b>${REPO.dir}</b> folder in <b>${REPO.owner}/${REPO.name}</b>. ` +
     `Add or delete files there from any computer. This screen checks every ${POLL_MS/60000} minutes ` +
     `and changes take effect at the end of the current cycle.`];
   if (pending)   bits.push('A change is waiting and will apply when this cycle finishes.');
@@ -652,13 +686,14 @@ function card(p, isNewsletter) {
   const thumb = document.createElement('div');
   thumb.className = 'thumb';
   if (isNewsletter) thumb.appendChild(newsletterEl());
+  else if (p.kind === 'video') { thumb.textContent = 'Video · silent · plays in full'; thumb.style.color = '#F5ECE4'; }
   else { const img = document.createElement('img'); img.src = p.src; thumb.appendChild(img); }
 
   const meta = document.createElement('div');
   meta.className = 'meta';
   meta.innerHTML = `<p class="name">${esc(p.name)}</p>` +
-    `<p class="dims">${isNewsletter ? '2:1, drawn to fit' : (p.w && p.h ? p.w+' × '+p.h : 'image') + shape(p)}</p>` +
-    takeoverNote(p);
+    `<p class="dims">${isNewsletter ? '2:1, drawn to fit' : (p.w && p.h ? p.w+' × '+p.h : p.kind) + shape(p)}</p>` +
+    takeoverNote(p) + (p.playbackError ? '<p class="err">' + esc(p.playbackError) + '</p>' : '');
   if (!isNewsletter && takeoverLive(p.takeover, Date.now())) el.classList.add('live');
 
   el.append(thumb, meta);
@@ -737,6 +772,7 @@ $('refreshBtn').onclick = async () => {
 
 /* No Play button: in kiosk mode the window is already full screen, so the
    loop starts on its own and the machine needs nobody after a restart. */
+if (LOCAL_PREVIEW) document.title = 'TEST ONLY - MOCA video rotation';
 poll(true);
 setInterval(poll, POLL_MS);
 
